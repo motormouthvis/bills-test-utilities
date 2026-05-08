@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local / editor
+.vscode/
+
+# Pywikibot & API caches (regenerated locally)
+apicache/
+apicache-py3/
+throttle.ctrl
+pywikibot.lwp
+
+# Archives
+*.zip

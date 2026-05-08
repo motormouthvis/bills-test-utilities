@@ -1,0 +1,11 @@
+
+To set up the environment:
+pip install beautifulsoup4 lxml
+Note:  must have both or beautifulsoup4 defaults to html
+
+pip install nltk
+From the terminal prompt:
+> Python
+> import nltk
+> nltk.download('punkt')
+Note: NLTK uses the punkt data

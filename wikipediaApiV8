@@ -1,0 +1,223 @@
+import pprint
+import nltk.data
+import re
+import sys
+import unicodedata
+from pyparsing import nums
+import requests
+import json
+from bs4 import BeautifulSoup
+sys.stdin.reconfigure(encoding='utf-8')
+sys.stdout.reconfigure(encoding='utf-8')
+debug = False
+
+WIKIPEDIA_REQUEST_HEADERS = {
+    "User-Agent": (
+        "MotormouthLocalWiki/1.0 "
+        "(Wikipedia/MediaWiki script; Python; +https://www.mediawiki.org/wiki/API:Etiquette)"
+    ),
+}
+
+replacement_character_strings = [
+    [r'\(\w{1}\)', ''],
+    [r'\(.{1,12}km\)', ''],
+    [r'\(\d{1,4}.{1,7}\sm\)', ''],
+    [r'\[edit\]', ''],
+    [r'\sel\.', ' elevation'],
+    [r'\(.{1,12}km2\)', ''],
+    [r'\[\d{0,3}\]', ''],
+    [r'\(\d{0,2}\)', ''],
+    [r'\d{1,3}°.{0,80}-\d{1,3}\.\d{1,7}.{1}', ''],
+    [r'Preview of references(.|\n)*', ''],
+    [r'\(.{1,8}°C\)', ''],
+    [r'\(.{1,12}mm\)', ''],
+    [r'\s,', ','],
+    [r'(\s|\n){2,200}', " "],
+    [r'\(CDP\)\s', " "],
+    [r'\(.*\(listen\).*\)\s', ''],
+    [r'\(.*[A-Z]+[-]{1}[a-z]+.*\)\s', ''],
+]
+
+# Helper function to clean text
+def replace_char_strings(text_to_scan, replacement_character_strings):
+    for char_string in replacement_character_strings:
+        text_to_scan = re.sub(char_string[0], char_string[1], text_to_scan)
+    return text_to_scan
+
+# Function to fetch Wikipedia TOC
+def get_wikipedia_toc(wiki_page_name, verbose=False):
+    toc_string = ""
+    toc_list = []
+    api_response_code = 400
+    api_response = ""
+    
+    params = {
+        "action": "parse",
+        "prop": "sections",
+        "format": "json",
+        "page": wiki_page_name
+    }
+    url = f'https://en.wikipedia.org/w/api.php?'
+    try:
+        api_response = requests.get(url, params=params, headers=WIKIPEDIA_REQUEST_HEADERS)
+        api_response_code = api_response.status_code
+        if api_response_code != 200:
+            toc_string = f'No Wikipedia TOC available for this location'
+            toc_list.append(toc_string)
+            return toc_string, toc_list, api_response_code
+
+        result = api_response.json()
+        if verbose:
+            print(f'JSON response from TOC request')    
+            print(json.dumps(result, indent=4))
+        
+        page_title = result['parse']['title']
+        page_id = result['parse']['pageid']
+        toc_list = []
+        toc_string = ""
+        for toc_item in result['parse']['sections']:
+            toc_list.append({"LineNum": toc_item["number"], "Descrip": toc_item["line"], "index": toc_item["index"], "toclevel": toc_item["toclevel"]})
+            toc_string += f'{"     " if "." in toc_item["number"] else ""}{toc_item["number"]}.  Title: {toc_item["line"]}  (Index: {toc_item["index"]})\n'
+        return toc_string, toc_list, 200
+    except:
+        error_message = f'API call to Wikipedia failed due to unknown reasons. Check url {url}, and params {params}'
+        return error_message, [error_message], 400
+
+# Function to fetch Wikipedia Intro
+def get_wikipedia_intro(wiki_page_name, num_sentences=100, verbose=False):
+    params = {
+        "action": "query",
+        "prop": "extracts",
+        "format": "json",
+        "exintro": "",
+        "explaintext": "",
+        "exsentences": num_sentences,
+        "titles": wiki_page_name,
+    }
+    url = "https://en.wikipedia.org/w/api.php"
+    api_response = requests.get(url, params=params, headers=WIKIPEDIA_REQUEST_HEADERS)
+    api_response_code = api_response.status_code
+    
+    if verbose:
+        print(f"wiki intro response code: {api_response_code}")
+    
+    if api_response_code != 200:
+        return f'No Wikipedia Intro text is available', 400
+
+    try:
+        response_dict = api_response.json()
+        page_id = next(iter(response_dict["query"]["pages"]))
+        if page_id == "-1":
+            return f'{wiki_page_name} is not a valid Wikipedia page', 400
+        
+        result = response_dict['query']['pages'][page_id]['extract']
+        if not result:
+            return f'The {wiki_page_name} Wikipedia page does not have an intro section', 204
+        
+        soup = BeautifulSoup(result, features="lxml")
+        clean_text = replace_char_strings(soup.get_text(), replacement_character_strings)
+        clean_text = unicodedata.normalize("NFKD", clean_text)
+        return clean_text, 200
+    except:
+        return f'Unable to parse JSON response', 400
+
+# Function to fetch Wikipedia section text
+def get_wikipedia_section_plain_text(wiki_page_name, index, verbose=False):
+    section_final_text = ""
+    section_para_list = []
+    no_paragraph_found_flag = True
+
+    params = {
+        "action": "parse",
+        "prop": "text",
+        "format": "json",
+        "page": wiki_page_name,
+        "section": index,
+        "contentformat": "text/plain",
+        "sectionpreview": "",
+        "preview": ""
+    }
+    url = "https://en.wikipedia.org/w/api.php"
+    api_response = requests.get(url, params=params, headers=WIKIPEDIA_REQUEST_HEADERS)
+    api_response_code = api_response.status_code
+    
+    if verbose:
+        print(api_response.url)
+    
+    if api_response_code != 200:
+        return f'No Wikipedia data is available for this topic', section_para_list, api_response_code, True
+
+    try:
+        result = api_response.json()['parse']['text']['*']
+        soup = BeautifulSoup(result, features="lxml")
+        for paragraph in soup.find_all('p'):
+            soup_text = paragraph.text
+            clean_text = replace_char_strings(soup_text, replacement_character_strings)
+            clean_text = unicodedata.normalize("NFKD", clean_text)
+            section_para_list.append(clean_text)
+            section_final_text += clean_text
+            no_paragraph_found_flag = False
+        
+        if no_paragraph_found_flag:
+            text = soup.get_text()
+            clean_text = replace_char_strings(text, replacement_character_strings)
+            clean_text = unicodedata.normalize("NFKD", clean_text)
+            section_final_text = clean_text
+            section_para_list.append(clean_text)
+        
+        return section_final_text, section_para_list, 200, no_paragraph_found_flag
+    except:
+        return f'No Wikipedia data is available for this topic', section_para_list, 400, True
+
+# Function for sentence parsing
+def sentence_parser(text_to_parse, sentence_count):
+    try:
+        tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+        sentence_list = tokenizer.tokenize(text_to_parse)
+        sentence_count = min(sentence_count, len(sentence_list))
+        sentence_text = " ".join(sentence_list[:sentence_count])
+        return sentence_list[:sentence_count], sentence_text
+    except:
+        return [text_to_parse], text_to_parse
+
+# Main execution
+if __name__ == "__main__":
+    wikipedia_page_name = "Fort_Pierce,_Florida"
+    
+    toc_string, toc_list, toc_code = get_wikipedia_toc(wikipedia_page_name)
+    if toc_code == 200:
+        if debug:
+            print("********************************** Wikipedia toc.list **********************************")
+            pprint.pprint(toc_list, sort_dicts=False)
+        print(toc_string)
+    else:
+        print(f'Wikipedia Table of contents is not available for this topic')
+
+    intro_text, intro_code = get_wikipedia_intro(wikipedia_page_name, 10)
+    if intro_code == 200:
+        print('Wikipedia Intro')
+        print(intro_text)
+    else:
+        print(f'Wikipedia introduction is not available for this topic')
+
+    toc_item = "history"
+    section_index = None
+    if toc_code == 200:
+        for item in toc_list:
+            if toc_item.lower() in item["Descrip"].lower():
+                section_index = item["index"]
+                toc_item = item["Descrip"]
+                print(f'\n{toc_item.capitalize()} section index = {section_index}')
+                break
+
+    if section_index is not None:
+        section_text, section_para_list, section_code, no_para_flag = get_wikipedia_section_plain_text(wikipedia_page_name, section_index)
+        if section_code == 200:
+            print(section_text)
+            num_sentences = 6
+            sentence_list, sentence_text = sentence_parser(section_text, num_sentences)
+            print(sentence_text)
+        else:
+            print(f'Wikipedia information is not available for this topic')
+    else:
+        print(f'No section found containing "{toc_item}" for this topic')
