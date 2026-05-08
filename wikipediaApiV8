@@ -200,24 +200,29 @@ if __name__ == "__main__":
     else:
         print(f'Wikipedia introduction is not available for this topic')
 
-    toc_item = "history"
-    section_index = None
+    # Fetch and print every TOC section (all levels)
     if toc_code == 200:
         for item in toc_list:
-            if toc_item.lower() in item["Descrip"].lower():
-                section_index = item["index"]
-                toc_item = item["Descrip"]
-                print(f'\n{toc_item.capitalize()} section index = {section_index}')
-                break
-
-    if section_index is not None:
-        section_text, section_para_list, section_code, no_para_flag = get_wikipedia_section_plain_text(wikipedia_page_name, section_index)
-        if section_code == 200:
-            print(section_text)
-            num_sentences = 6
-            sentence_list, sentence_text = sentence_parser(section_text, num_sentences)
-            print(sentence_text)
-        else:
-            print(f'Wikipedia information is not available for this topic')
+            if not isinstance(item, dict):
+                continue
+            desc = item["Descrip"]
+            sec_idx = item["index"]
+            line_num = item["LineNum"]
+            toc_lvl = item.get("toclevel", 1)
+            indent = "  " * max(0, toc_lvl - 1)
+            bar = "=" * 72
+            print(f"\n{bar}")
+            print(f"{indent}[{line_num}] {desc}  (section index {sec_idx})")
+            print(f"{bar}")
+            section_text, section_para_list, section_code, no_para_flag = (
+                get_wikipedia_section_plain_text(wikipedia_page_name, sec_idx)
+            )
+            if section_code == 200:
+                if section_text and section_text.strip():
+                    print(section_text)
+                else:
+                    print("(no plain text returned for this section)")
+            else:
+                print(section_text)
     else:
-        print(f'No section found containing "{toc_item}" for this topic')
+        print(f'Cannot fetch section bodies without a valid Wikipedia table of contents.')
