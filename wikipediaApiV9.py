@@ -1,89 +1,34 @@
 """
-wikipediaApiV9.py
-=================
+Wikipedia snippets for Motormouth / Dream Neighborhood read-aloud flows.
 
-Purpose
--------
-Fetch a **small number** of Wikipedia article sections quickly for read-aloud or
-preview scenarios. Compared to scraping the whole article or iterating every TOC
-entry (see wikipediaApiV8), this module:
+Upstream of this module: lat/lon → **Wikidata entity id** (e.g. SimpleMaps). This file
+takes that **Q-id**, resolves the English Wikipedia title via Wikidata sitelinks, then
+calls MediaWiki ``action=parse`` only as needed: one ``prop=sections`` pass for the TOC,
+then ``prop=text`` for the **lead** (section index ``"0"``) and for each configured TOC
+topic (default: history, geography) using the API **section index** from the TOC—not the
+printed outline numbers. Bodies are cleaned with regex, then each block is capped to the
+first **N** sentences via NLTK ``sent_tokenize`` (see ``clip_to_max_sentences``).
 
-    * Makes **one** `parse` + `sections` request to learn all section IDs.
-    * Makes **one** `parse` + `text` request for the **introduction** (section ``0``)
-      plus **one** such request **per configured topic keyword** matched from the TOC
-      (typically introduction + History + Geography).
-    * Optionally truncates each section to the first N sentences via NLTK.
-    * Reuses one HTTP Session (keep-alive) across calls.
+**Architecture gotchas:** parse requests use ``redirects=1`` (redirect titles else empty
+TOC). ``first_toc_match`` avoids ``history`` matching inside ``Prehistory``. Needs NLTK
+punkt data in deploy bundles.
 
-Design notes
-------------
-English Wikipedia APIs require a descriptive User-Agent string; Wikimedia commonly
-issues HTTP 403 to generic/default clients. Headers are centralized in
-`WIKIPEDIA_REQUEST_HEADERS`.
-
-Production plumbing can be: latitude/longitude → **Wikidata entity id** (e.g. from a
-commercial place DB) → ``enwiki_underscore_title_from_wikidata_id`` → English
-``action=parse`` calls below. The ``__main__`` batch list is ``(Q-id, display name)``
-pairs for tests only—the display name is for logs; the API path always uses the
-sitelink title resolved from the Q-id.
-
-All ``action=parse`` requests pass ``redirects=1`` so a title like
-``Denver,_Colorado`` (a redirect) resolves to the canonical article (``Denver``);
-otherwise ``prop=sections`` can return **zero** rows and History/Geography lookups
-silently fail even though the destination article has those sections.
-
-MediaWiki TOC entries expose a numeric **section index** (string) distinct from the
-printed outline number (“1”, “2.1”, …). API calls **must use that index**, not the
-outline number—this script reads `sections[].index` from the TOC response.
-
-The article **introduction** (lead text before the first heading) is requested with
-section index ``"0"``; it is not resolved via the TOC.
-
-`section_topics` lists **keywords** matched **exactly** to a TOC title first, then
-as a **non-embedded** substring (so ``history`` does not match **Prehistory**).
-The **first** qualifying row wins in document order.
-
-Dependencies
------------
-    requests, bs4/lxml (BeautifulSoup backend), nltk (+ punkt tokenizer data).
-
-Sentence clipping uses ``nltk.tokenize.sent_tokenize``. If NLTK warns about punkt:
-    >>> import nltk; nltk.download("punkt_tab")
-
-This mirrors other Motormouth wiki utilities that depend on Punkt-like models.
+Deps: requests, bs4+lxml, nltk.
 """
 
-# ---------------------------------------------------------------------------
-# Standard library
-# ---------------------------------------------------------------------------
 import random
 import re
 import sys
 import time
 import unicodedata
 
-# ---------------------------------------------------------------------------
-# Third party
-# ---------------------------------------------------------------------------
-import requests  # synchronous HTTP client; Session used for TCP reuse below
-from bs4 import BeautifulSoup  # parses HTML-ish section bodies from the parse API
-
-# NLTK tokenizer: statistically aware sentence splitting (preferred over naive
-# "split on period" hacks that break on "St.", "Dr.", "approx.", decimals, …).
+import requests
+from bs4 import BeautifulSoup
 from nltk.tokenize import sent_tokenize
 
-# ---------------------------------------------------------------------------
-# UTF-8 stdio on Windows (console code pages often mismatched otherwise)
-# ---------------------------------------------------------------------------
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 
-# ---------------------------------------------------------------------------
-# HTTP compliance: Wikimedia User-Agent requirement
-#
-# Wikimedia forbids unidentified scripts; descriptive UA + etiquette link reduces
-# 403 surprises. Keep this aligned with sibling modules (wikipediaApiV7/V8).
-# ---------------------------------------------------------------------------
 WIKIPEDIA_REQUEST_HEADERS = {
     "User-Agent": (
         "MotormouthLocalWiki/1.0 "
@@ -91,17 +36,7 @@ WIKIPEDIA_REQUEST_HEADERS = {
     ),
 }
 
-# ---------------------------------------------------------------------------
-# Post-processing: regex pairs [pattern, replacement]
-#
-# Wikipedia HTML plain-text still carries artifacts (IPA, metric parentheticals,
-# "[edit]" junk, pronunciation guides). These patterns strip or normalize text so
-# TTS / VUI output is smoother. Mirrors the list pattern used in wikipediaApiV8 /
-# GetWikipediaInfo in V7; keep edits in sync if you change pronunciation policy.
-#
-# Order matters slightly: heavier “delete rest of page” patterns should stay where
-# they won’t shred legitimate prose (see Preview-of-references line).
-# ---------------------------------------------------------------------------
+# TTS/VUI cleanup; order matters (e.g. "Preview of references" nukes tail junk).
 replacement_character_strings = [
     [r"\(\w{1}\)", ""],
     [r"\(.{1,12}km\)", ""],
@@ -124,49 +59,13 @@ replacement_character_strings = [
 
 
 def replace_char_strings(text_to_scan, rules):
-    """
-    Apply a list of (regex, replacement_string) tuples in sequence.
-
-    Args:
-        text_to_scan: raw string pulled from markup (paragraph or whole section).
-        rules: iterable of two-element sequences; typical source is the module-level
-            ``replacement_character_strings`` list above.
-
-    Returns:
-        The same string conceptually; each rule mutates sequentially.
-    """
     for pattern, repl in rules:
         text_to_scan = re.sub(pattern, repl, text_to_scan)
     return text_to_scan
 
 
 def fetch_toc_list(wiki_page_name, session=None):
-    """
-    Retrieve structured table-of-contents rows for ``wiki_page_name``.
-
-    Hits:
-        GET https://en.wikipedia.org/w/api.php
-        action=parse&prop=sections&format=json&page=<title>
-
-    Args:
-        wiki_page_name: article title exactly as Wikipedia expects in API calls,
-            e.g. ``"Fort_Pierce,_Florida"`` with underscores—not the pretty URL slug
-            variant that omits commas unless the API accepts it (underscore form is safest).
-        session: optional ``requests.Session`` for connection reuse with section fetches;
-            ``None`` falls back to the ``requests`` module top-level helpers.
-
-    Returns:
-        Tuple ``(toc_list, status_code-ish)``.
-        * On success: ``toc_list`` is a list of dicts with keys ``LineNum`` (outline
-          number string), ``Descrip`` (TOC line text), ``index`` (MediaWiki section id),
-          ``toclevel`` (nesting depth, 1 = top-level §).
-        * On failure: ``[]`` plus the HTTP status or ``400`` for JSON/parse failures.
-          Callers distinguish success with ``toc_code == 200`` convention used in main.
-
-    Important:
-        The ``index`` strings are opaque to this script—we pass them verbatim into
-        ``get_wikipedia_section_plain_text``. Do **not** substitute ``LineNum``.
-    """
+    """TOC rows for substring matching; use ``index`` in parse calls (not outline ``LineNum``)."""
     params = {
         "action": "parse",
         "prop": "sections",
@@ -175,13 +74,9 @@ def fetch_toc_list(wiki_page_name, session=None):
         "redirects": 1,
     }
     url = "https://en.wikipedia.org/w/api.php"
-
-    # Use session if caller provided one so TLS + TCP handshakes amortize across calls.
     req = session if session is not None else requests
     try:
         r = req.get(url, params=params, headers=WIKIPEDIA_REQUEST_HEADERS, timeout=30)
-
-        # Non-200: surface status; empty list implies caller should abort TOC-driven work.
         if r.status_code != 200:
             return [], r.status_code
 
@@ -190,60 +85,27 @@ def fetch_toc_list(wiki_page_name, session=None):
 
         toc_list = []
         for s in sections:
-            # Normalize field names slightly for downstream Python code (camel-ish keys).
             toc_list.append(
                 {
-                    "LineNum": s["number"],  # e.g. "1", "3.2" — display only here
-                    "Descrip": s["line"],  # TOC label; substring match targets this
-                    "index": s["index"],  # **API section parameter** lives here
+                    "LineNum": s["number"],
+                    "Descrip": s["line"],
+                    "index": s["index"],
                     "toclevel": s["toclevel"],
                 }
             )
         return toc_list, 200
     except Exception:
-        # Network loss, malformed JSON, missing keys, etc.: treat uniformly as TOC failure.
         return [], 400
 
 
 def get_wikipedia_section_plain_text(
     wiki_page_name, index, verbose=False, session=None
 ):
-    """
-    Retrieve one section body as plaintext-ish HTML soup text with cleanup regexes.
-
-    Hits:
-        GET https://en.wikipedia.org/w/api.php
-        action=parse&prop=text&format=json&page=<title>&section=<index>
-        &contentformat=text/plain&redirects=1
-
-    Wikipedia still returns markup fragments in practice; BeautifulSoup collapses tags
-    to strings. Paragraphs accumulate in preference order (`<p>` nodes); sections that
-    are pure lists/templates may lack `<p>`—then we grab `soup.get_text()` wholesale.
-
-    Args:
-        wiki_page_name: same title encoding rules as TOC fetch (underscores typical).
-        index: TOC ``index`` string from fetch_toc_list, **not** the outline LineNum.
-        verbose: echo resolved request URL when True—handy debugging rate limits /
-            malformed parameters.
-        session: shared ``requests.Session`` or ``None``.
-
-    Returns:
-        Quadruple::
-            (section_final_text,
-             section_para_list,  # paragraphs collected (callers ignore in V9 main)
-             api_response_code,  # 200 success, else HTTP code or 400 on parse fail
-             no_paragraph_found_flag)  # True when only fallback get_text() path ran
-
-    Error contract:
-        On HTTP errors or JSON issues, first element is a short human error string;
-        call sites should not run sentence tokenizers on that path.
-    """
+    """Parse one ``section=<index>`` body; prefer ``<p>`` text, else ``get_text()`` fallback."""
     section_final_text = ""
     section_para_list = []
     no_paragraph_found_flag = True
 
-    # MediaWiki boolean-like parameters: empty string often means "true" for flags;
-    # keep sectionpreview/preview empty as in production V7/V8 calls.
     params = {
         "action": "parse",
         "prop": "text",
@@ -274,11 +136,9 @@ def get_wikipedia_section_plain_text(
         )
 
     try:
-        # Star key is literal per MediaWiki JSON shape: {"parse":{"text":{"*":"..."}}}
         result = api_response.json()["parse"]["text"]["*"]
         soup = BeautifulSoup(result, features="lxml")
 
-        # Primary path: concatenate visible paragraph text in document order.
         for paragraph in soup.find_all("p"):
             soup_text = paragraph.text
             clean_text = replace_char_strings(
@@ -290,7 +150,6 @@ def get_wikipedia_section_plain_text(
             no_paragraph_found_flag = False
 
         if no_paragraph_found_flag:
-            # Fallback: infobox-only / list-heavy sections may have no <p>.
             text = soup.get_text()
             clean_text = replace_char_strings(text, replacement_character_strings)
             clean_text = unicodedata.normalize("NFKD", clean_text)
@@ -303,31 +162,10 @@ def get_wikipedia_section_plain_text(
 
 
 def first_toc_match(toc_list, keyword):
-    """
-    Walk TOC rows in order and map ``keyword`` to a section index.
-
-    Matching order:
-
-    1. **Exact** title (case-insensitive, stripped), e.g. ``"history"`` → ``"History"``.
-    2. **Substring** occurrences of ``keyword`` in the title, **skipping** matches
-       glued inside a longer word. That avoids ``"history"`` matching **Prehistory**
-       before **History**, which produced sparse HTML and nonsense sentence clips.
-
-    Prefix matches still work: ``"geo"`` can match ``"Geography"`` (no letter before
-    ``"geo"``).
-
-    Args:
-        toc_list: list of dicts from ``fetch_toc_list`` (skips non-dict entries defensively).
-        keyword: user-configured topic token from ``section_topics`` in main.
-
-    Returns:
-        ``(section_index, display_title)`` or ``(None, None)`` if no row matches.
-    """
+    """Match TOC label to API index: exact title first, else substring (not inside a longer word: Prehistory vs History)."""
     kw = keyword.lower()
     for item in toc_list:
         if not isinstance(item, dict):
-            # Defensive: error-handling paths elsewhere may stuff strings into lists;
-            # keep robust if this helper is reused outside the happy path.
             continue
         desc_strip = item["Descrip"].strip().lower()
         if desc_strip == kw:
@@ -351,23 +189,7 @@ def first_toc_match(toc_list, keyword):
 
 
 def clip_to_max_sentences(text, max_sentences):
-    """
-    Limit ``text`` to the first ``max_sentences`` NLTK tokenized sentences.
-
-    Args:
-        text: full section body after cleanup (should not be an error placeholder string).
-        max_sentences: positive int applies cap; **0 or negative** disables clipping and
-            returns the original string whole—useful for debugging long sections.
-
-    Returns:
-        Space-joined sentence string. If fewer sentences exist than the cap, returns
-        all of them without padding.
-
-    Note:
-        ``sent_tokenize`` incurs small CPU cost but avoids naive period-splitting bugs.
-        Whitespace is collapsed first so stray newlines do not confuse the tokenizer.
-        Sentences with no letters (pure punctuation) are skipped when applying the cap.
-    """
+    """First ``max_sentences`` NLTK sentences (whitespace-normalized); ``max_sentences<=0`` = no cap."""
     if not text or not str(text).strip():
         return text
     if max_sentences <= 0:
@@ -383,12 +205,7 @@ def clip_to_max_sentences(text, max_sentences):
 
 
 def enwiki_underscore_title_from_wikidata_id(wikidata_id, session=None):
-    """
-    Resolve a Wikidata Q-id to the English Wikipedia article title (underscore form).
-
-    Intended flow: lat/lon → Wikidata id (e.g. from a simplemaps-style DB) → this
-    helper → ``fetch_toc_list`` / ``get_wikipedia_section_plain_text``.
-    """
+    """Q-id → enwiki sitelink title (underscores). See module docstring for product flow."""
     raw = str(wikidata_id).strip()
     m = re.match(r"^Q?(\d+)$", raw, re.I)
     if not m:
@@ -425,13 +242,7 @@ def preview_wikipedia_article(
     *,
     verbose=True,
 ):
-    """
-    Fetch the article introduction (section ``0``) plus each ``section_topics`` TOC
-    match; optionally print blocks. Returns a small status dict for batch runs.
-
-    Returns:
-        dict with keys: ``page``, ``ok`` (bool), ``notes`` (list of str).
-    """
+    """Lead + ``section_topics`` via TOC; returns ``{page, ok, notes}`` for batch harness."""
     notes = []
     toc_list, toc_code = fetch_toc_list(wiki_page_name, session=session)
     if toc_code != 200:
@@ -486,9 +297,6 @@ def preview_wikipedia_article(
     return {"page": wiki_page_name, "ok": ok, "notes": notes}
 
 
-# ---------------------------------------------------------------------------
-# Script entry point: wire configuration, drive I/O, print human-readable blocks
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     WIKIDATA_TEST_CITIES = [
         ('Q60', 'New York City'),
@@ -744,21 +552,12 @@ if __name__ == "__main__":
     ]
 
     max_sentences_to_display = 5
-
     section_topics = ["history", "geography"]
-
-    # ``"errors_only"`` → one status line per city; details only on FAIL.
-    # ``"full"`` → print Introduction / History / Geography for every city.
-    BATCH_SHOW = "errors_only"
-
-    # Subset after optional shuffle: slice(None) | slice(0, 250) | slice(0, 9, 3), etc.
+    BATCH_SHOW = "errors_only"  # or "full"
     CITY_TEST_SLICE = slice(0, 250)
-
     BATCH_SHUFFLE_SEED = None
     BATCH_DELAY_SECONDS = 0.2
-
-    # Debug one entity: e.g. ("Q16554", "Denver")
-    SINGLE_WIKIDATA_FIXTURE = None
+    SINGLE_WIKIDATA_FIXTURE = None  # e.g. ("Q16554", "Denver")
 
     city_slice = CITY_TEST_SLICE
     if len(sys.argv) >= 2:
