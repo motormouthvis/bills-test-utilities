@@ -28,9 +28,9 @@ outline number—this script reads `sections[].index` from the TOC response.
 The article **introduction** (lead text before the first heading) is requested with
 section index ``"0"``; it is not resolved via the TOC.
 
-`section_topics` lists **substring** patterns matched case-insensitively against TOC
-titles. The **first** match wins for each topic in list order (“History” beats
-“The Florida Highwaymen” if you mistakenly put a generic keyword).
+`section_topics` lists **keywords** matched **exactly** to a TOC title first, then
+as a **non-embedded** substring (so ``history`` does not match **Prehistory**).
+The **first** qualifying row wins in document order.
 
 Dependencies
 -----------
@@ -289,11 +289,17 @@ def get_wikipedia_section_plain_text(
 
 def first_toc_match(toc_list, keyword):
     """
-    Walk TOC rows in order; return the first section whose title contains ``keyword``.
+    Walk TOC rows in order and map ``keyword`` to a section index.
 
-    Matching is **substring**, case-insensitive: ``"geo"`` matches ``"Geography"``.
-    Be intentional with ``section_topics``—overly short tokens may false-positive
-    (rare for "history" / "economy" but possible for "art").
+    Matching order:
+
+    1. **Exact** title (case-insensitive, stripped), e.g. ``"history"`` → ``"History"``.
+    2. **Substring** occurrences of ``keyword`` in the title, **skipping** matches
+       glued inside a longer word. That avoids ``"history"`` matching **Prehistory**
+       before **History**, which produced sparse HTML and nonsense sentence clips.
+
+    Prefix matches still work: ``"geo"`` can match ``"Geography"`` (no letter before
+    ``"geo"``).
 
     Args:
         toc_list: list of dicts from ``fetch_toc_list`` (skips non-dict entries defensively).
@@ -308,8 +314,24 @@ def first_toc_match(toc_list, keyword):
             # Defensive: error-handling paths elsewhere may stuff strings into lists;
             # keep robust if this helper is reused outside the happy path.
             continue
-        if kw in item["Descrip"].lower():
+        desc_strip = item["Descrip"].strip().lower()
+        if desc_strip == kw:
             return item["index"], item["Descrip"]
+
+    for item in toc_list:
+        if not isinstance(item, dict):
+            continue
+        desc = item["Descrip"]
+        dl = desc.lower()
+        start = 0
+        while True:
+            i = dl.find(kw, start)
+            if i == -1:
+                break
+            embedded_left = i > 0 and dl[i - 1].isalpha()
+            if not embedded_left:
+                return item["index"], item["Descrip"]
+            start = i + 1
     return None, None
 
 
@@ -328,12 +350,18 @@ def clip_to_max_sentences(text, max_sentences):
 
     Note:
         ``sent_tokenize`` incurs small CPU cost but avoids naive period-splitting bugs.
+        Whitespace is collapsed first so stray newlines do not confuse the tokenizer.
+        Sentences with no letters (pure punctuation) are skipped when applying the cap.
     """
     if not text or not str(text).strip():
         return text
     if max_sentences <= 0:
         return text
-    sentences = sent_tokenize(text.strip())
+    collapsed = re.sub(r"\s+", " ", str(text).strip())
+    sentences = sent_tokenize(collapsed)
+    sentences = [s for s in sentences if any(ch.isalpha() for ch in s)]
+    if not sentences:
+        return collapsed
     if len(sentences) <= max_sentences:
         return " ".join(sentences)
     return " ".join(sentences[:max_sentences])
@@ -355,7 +383,8 @@ if __name__ == "__main__":
 
     # --- Which sections to pull (after introduction) -------------------------
     # Introduction uses MediaWiki section index "0" (lead before first heading).
-    # Each keyword here is matched as a substring against TOC titles, top-down.
+    # Each keyword here is matched against TOC titles (exact title, then safe
+    # substring). See ``first_toc_match``.
     # One keyword == one parse+text request after the intro fetch.
     section_topics = ["history", "geography"]
 
