@@ -55,6 +55,7 @@ import re
 import sys
 import time
 import unicodedata
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Third party
@@ -449,151 +450,61 @@ def preview_wikipedia_article(
 # Script entry point: wire configuration, drive I/O, print human-readable blocks
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # --- Output shaping ------------------------------------------------------
-    # Cap printed sentences per block (introduction, then each TOC topic). Set to 0
-    # (or any non-positive) to dump the entire cleaned body without NLTK truncation.
     max_sentences_to_display = 5
 
-    # --- Which sections to pull (after introduction) -------------------------
-    # Introduction uses MediaWiki section index "0" (lead before first heading).
-    # Each keyword here is matched against TOC titles (exact title, then safe
-    # substring). See ``first_toc_match``.
     section_topics = ["history", "geography"]
 
-    # --- Batch harness: sample cities + how many to run ----------------------
-    # English Wikipedia `page` titles (underscores between words). Diverse mix for
-    # smoke testing—not a definitive geographic census.
-    CITY_PAGE_NAMES_SAMPLE = """
-New_York_City
-Los_Angeles
-Chicago
-Houston
-Phoenix,_Arizona
-Philadelphia
-San_Antonio
-San_Diego
-Dallas
-Austin,_Texas
-Jacksonville,_Florida
-Fort_Worth,_Texas
-Columbus,_Ohio
-Charlotte,_North_Carolina
-San_Francisco
-Indianapolis
-Seattle
-Denver,_Colorado
-Boston
-El_Paso,_Texas
-Nashville,_Tennessee
-Detroit
-Portland,_Oregon
-Las_Vegas
-Memphis,_Tennessee
-Louisville,_Kentucky
-Baltimore
-Milwaukee
-Albuquerque,_New_Mexico
-Tucson,_Arizona
-Fresno,_California
-Sacramento,_California
-Kansas_City,_Missouri
-Atlanta
-Miami
-Oakland,_California
-Minneapolis
-Tulsa,_Oklahoma
-Cleveland
-Wichita,_Kansas
-Arlington,_Texas
-New_Orleans
-Honolulu
-Tampa,_Florida
-London
-Paris
-Berlin
-Rome
-Madrid
-Amsterdam
-Vienna
-Brussels
-Moscow
-Warsaw
-Prague
-Budapest
-Athens
-Dublin
-Stockholm
-Copenhagen
-Lisbon
-Bucharest
-Istanbul
-Dubai
-Cairo
-Lagos
-Johannesburg
-Nairobi
-Buenos_Aires
-Santiago
-Lima
-Mexico_City
-Toronto
-Vancouver
-Sydney
-Melbourne
-Tokyo
-Osaka
-Seoul
-Beijing
-Shanghai
-Hong_Kong
-Singapore
-Bangkok
-Jakarta
-Manila
-Mumbai
-Delhi
-Tehran
-Tel_Aviv
-Casablanca
-Cape_Town
-Rio_de_Janeiro
-Montreal
-Perth
-Brisbane
-Auckland
-Kyiv
-Saint_Petersburg
-Fort_Pierce,_Florida
-    """.split()
+    # --- 250 US city Wikipedia titles (underscores; population table order) -----
+    _CITY_LIST_PATH = Path(__file__).resolve().parent / "us_city_pages_250.txt"
+    CITY_PAGE_NAMES_US_250 = [
+        ln.strip()
+        for ln in _CITY_LIST_PATH.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
 
-    # If set (non-empty string), run a verbose preview for this page only—ignores
-    # NUM_CITIES_TO_TEST and the sample list order except as a fallback label.
     SINGLE_WIKI_PAGE_ONLY = None  # e.g. "Fort_Pierce,_Florida"
 
-    # How many entries from CITY_PAGE_NAMES_SAMPLE to run in batch mode:
-    #   1   → only the first city in the list after optional shuffle
-    #   0 or None → all cities in the list
-    NUM_CITIES_TO_TEST = 1
+    # ``"errors_only"`` → one status line per city; details only on FAIL.
+    # ``"full"`` → print Introduction / History / Geography for every city.
+    BATCH_SHOW = "errors_only"
 
-    # Optional override: ``python wikipediaApiV9.py 10`` runs the first 10 cities (after
-    # shuffle) without editing this file. ``python wikipediaApiV9.py 0`` runs all.
-    if len(sys.argv) >= 2:
-        try:
-            arg_n = int(sys.argv[1])
-            NUM_CITIES_TO_TEST = None if arg_n == 0 else arg_n
-        except ValueError:
-            print("Usage: python wikipediaApiV9.py [N]   (N=0 means all cities)", file=sys.stderr)
-            sys.exit(2)
+    # Subset after optional shuffle (Python ``list`` slicing), e.g.:
+    #   slice(None)    → all 250
+    #   slice(0, 250)  → indices 0 .. 249
+    #   slice(0, 9, 3) → indices 0, 3, 6
+    CITY_TEST_SLICE = slice(0, 250)
 
-    # If an int, `random.Random(seed).shuffle` the sample before slicing (reproducible
-    # “random” order). If None, keep the list order above.
     BATCH_SHUFFLE_SEED = None
-
-    # Pause between cities in batch mode (Wikimedia rate courtesy).
     BATCH_DELAY_SECONDS = 0.2
+
+    # Optional CLI: overrides ``CITY_TEST_SLICE`` (applied after shuffle):
+    #   python wikipediaApiV9.py N              → slice(0, N); N<=0 → all
+    #   python wikipediaApiV9.py start stop [step]
+    city_slice = CITY_TEST_SLICE
+    if len(sys.argv) >= 2:
+        parts = []
+        for a in sys.argv[1:4]:
+            try:
+                parts.append(int(a))
+            except ValueError:
+                print(
+                    "Usage: wikipediaApiV9.py [stop] | "
+                    "wikipediaApiV9.py start stop [step]",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        if len(parts) == 1:
+            n = parts[0]
+            city_slice = slice(None) if n <= 0 else slice(0, n)
+        elif len(parts) == 2:
+            city_slice = slice(parts[0], parts[1])
+        else:
+            city_slice = slice(parts[0], parts[1], parts[2])
 
     http = requests.Session()
     http.headers.update(WIKIPEDIA_REQUEST_HEADERS)
+
+    show_full_sections = BATCH_SHOW == "full"
 
     if SINGLE_WIKI_PAGE_ONLY:
         preview_wikipedia_article(
@@ -601,19 +512,16 @@ Fort_Pierce,_Florida
             http,
             section_topics,
             max_sentences_to_display,
-            verbose=True,
+            verbose=show_full_sections,
         )
     else:
-        cities = [x.strip() for x in CITY_PAGE_NAMES_SAMPLE if x.strip()]
+        cities = list(CITY_PAGE_NAMES_US_250)
         if BATCH_SHUFFLE_SEED is not None:
-            rng = random.Random(BATCH_SHUFFLE_SEED)
-            rng.shuffle(cities)
-
-        limit = NUM_CITIES_TO_TEST
-        if limit is None or limit <= 0:
-            cities_run = cities
-        else:
-            cities_run = cities[: min(limit, len(cities))]
+            random.Random(BATCH_SHUFFLE_SEED).shuffle(cities)
+        cities_run = cities[city_slice]
+        if not cities_run:
+            print("No cities selected (empty slice).", file=sys.stderr)
+            sys.exit(1)
 
         if len(cities_run) == 1:
             preview_wikipedia_article(
@@ -621,27 +529,37 @@ Fort_Pierce,_Florida
                 http,
                 section_topics,
                 max_sentences_to_display,
-                verbose=True,
+                verbose=show_full_sections,
             )
         else:
             print(
-                f"Batch: {len(cities_run)} cities, "
-                f"{BATCH_DELAY_SECONDS}s delay between pages\n"
+                f"Batch: {len(cities_run)} cities | slice {city_slice} | "
+                f"show={BATCH_SHOW!r} | delay={BATCH_DELAY_SECONDS}s\n"
             )
             results = []
             for i, page in enumerate(cities_run, start=1):
-                print(f"[{i}/{len(cities_run)}] {page} ... ", end="", flush=True)
+                if show_full_sections:
+                    print(f"\n{'#' * 72}\n[{i}/{len(cities_run)}] {page}\n{'#' * 72}")
+                else:
+                    print(f"[{i}/{len(cities_run)}] {page} ... ", end="", flush=True)
                 r = preview_wikipedia_article(
                     page,
                     http,
                     section_topics,
                     max_sentences_to_display,
-                    verbose=False,
+                    verbose=show_full_sections,
                 )
                 results.append(r)
-                print("OK" if r["ok"] else "FAIL")
-                for note in r["notes"]:
-                    print(f"         · {note}")
+                if show_full_sections:
+                    print(
+                        f"\n——— [{i}/{len(cities_run)}] {page}: "
+                        f"{'OK' if r['ok'] else 'FAIL'} ———\n"
+                    )
+                else:
+                    print("OK" if r["ok"] else "FAIL")
+                    if not r["ok"]:
+                        for note in r["notes"]:
+                            print(f"         · {note}")
                 time.sleep(BATCH_DELAY_SECONDS)
 
             ok_n = sum(1 for r in results if r["ok"])
