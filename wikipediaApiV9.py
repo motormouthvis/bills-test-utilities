@@ -21,6 +21,11 @@ English Wikipedia APIs require a descriptive User-Agent string; Wikimedia common
 issues HTTP 403 to generic/default clients. Headers are centralized in
 `WIKIPEDIA_REQUEST_HEADERS`.
 
+All ``action=parse`` requests pass ``redirects=1`` so a title like
+``Denver,_Colorado`` (a redirect) resolves to the canonical article (``Denver``);
+otherwise ``prop=sections`` can return **zero** rows and History/Geography lookups
+silently fail even though the destination article has those sections.
+
 MediaWiki TOC entries expose a numeric **section index** (string) distinct from the
 printed outline number (“1”, “2.1”, …). API calls **must use that index**, not the
 outline number—this script reads `sections[].index` from the TOC response.
@@ -161,6 +166,7 @@ def fetch_toc_list(wiki_page_name, session=None):
         "prop": "sections",
         "format": "json",
         "page": wiki_page_name,
+        "redirects": 1,
     }
     url = "https://en.wikipedia.org/w/api.php"
 
@@ -202,7 +208,7 @@ def get_wikipedia_section_plain_text(
     Hits:
         GET https://en.wikipedia.org/w/api.php
         action=parse&prop=text&format=json&page=<title>&section=<index>
-        &contentformat=text/plain
+        &contentformat=text/plain&redirects=1
 
     Wikipedia still returns markup fragments in practice; BeautifulSoup collapses tags
     to strings. Paragraphs accumulate in preference order (`<p>` nodes); sections that
@@ -239,6 +245,7 @@ def get_wikipedia_section_plain_text(
         "page": wiki_page_name,
         "section": index,
         "contentformat": "text/plain",
+        "redirects": 1,
         "sectionpreview": "",
         "preview": "",
     }
