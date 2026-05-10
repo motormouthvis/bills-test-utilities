@@ -1,19 +1,23 @@
 """
-Wikipedia snippets for Motormouth / Dream Neighborhood read-aloud flows.
+Pull short Wikipedia blurbs for **Dream Neighborhood** (Motormouth).
 
-Upstream of this module: lat/lon → **Wikidata entity id** (e.g. SimpleMaps). This file
-takes that **Q-id**, resolves the English Wikipedia title via Wikidata sitelinks, then
-calls MediaWiki ``action=parse`` only as needed: one ``prop=sections`` pass for the TOC,
-then ``prop=text`` for the **lead** (section index ``"0"``) and for each configured TOC
-topic (default: history, geography) using the API **section index** from the TOC—not the
-printed outline numbers. Bodies are cleaned with regex, then each block is capped to the
-first **N** sentences via NLTK ``sent_tokenize`` (see ``clip_to_max_sentences``).
+Here’s how it fits together: your app already has the user’s **latitude and longitude**.
+You look up the **Wikidata Q-id straight from your SimpleMaps data**—no city-name
+guessing. This module starts from that Q-id: it finds the matching English Wikipedia
+article, then calls the MediaWiki API in a tight way—one pass for the table of contents,
+then fetches the **lead** (section ``"0"``) and whatever sections you care about (by
+default history and geography). TOC matching uses the API’s **section index**, not the
+pretty outline numbers you see on the page. Text gets a quick scrub for junk characters,
+then each chunk is trimmed to the first **N** full sentences (NLTK ``sent_tokenize``).
 
-**Architecture gotchas:** parse requests use ``redirects=1`` (redirect titles else empty
-TOC). ``first_toc_match`` avoids ``history`` matching inside ``Prehistory``. Needs NLTK
-punkt data in deploy bundles.
+Output is meant for **on-screen display**, not voice readout.
 
-Deps: requests, bs4+lxml, nltk.
+**Worth watching:** always use ``redirects=1`` on parse calls or you can get an empty TOC
+on redirect titles. Keyword matching skips ``history`` when it’s buried inside something
+like “Prehistory.” Ship NLTK punkt (or ``punkt_tab``) with the app so sentence clipping
+works in production.
+
+Dependencies: requests, bs4+lxml, nltk.
 """
 
 import random
@@ -36,7 +40,7 @@ WIKIPEDIA_REQUEST_HEADERS = {
     ),
 }
 
-# TTS/VUI cleanup; order matters (e.g. "Preview of references" nukes tail junk).
+# Regex cleanup for nicer on-screen blurbs; order matters (e.g. references tail).
 replacement_character_strings = [
     [r"\(\w{1}\)", ""],
     [r"\(.{1,12}km\)", ""],
@@ -205,7 +209,7 @@ def clip_to_max_sentences(text, max_sentences):
 
 
 def enwiki_underscore_title_from_wikidata_id(wikidata_id, session=None):
-    """Q-id → enwiki sitelink title (underscores). See module docstring for product flow."""
+    """Q-id → enwiki sitelink title (underscores). SimpleMaps supplies the Q-id upstream."""
     raw = str(wikidata_id).strip()
     m = re.match(r"^Q?(\d+)$", raw, re.I)
     if not m:
