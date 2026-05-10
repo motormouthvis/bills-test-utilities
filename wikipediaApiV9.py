@@ -21,6 +21,12 @@ English Wikipedia APIs require a descriptive User-Agent string; Wikimedia common
 issues HTTP 403 to generic/default clients. Headers are centralized in
 `WIKIPEDIA_REQUEST_HEADERS`.
 
+Production plumbing can be: latitude/longitude → **Wikidata entity id** (e.g. from a
+commercial place DB) → ``enwiki_underscore_title_from_wikidata_id`` → English
+``action=parse`` calls below. The ``__main__`` batch list is ``(Q-id, display name)``
+pairs for tests only—the display name is for logs; the API path always uses the
+sitelink title resolved from the Q-id.
+
 All ``action=parse`` requests pass ``redirects=1`` so a title like
 ``Denver,_Colorado`` (a redirect) resolves to the canonical article (``Denver``);
 otherwise ``prop=sections`` can return **zero** rows and History/Geography lookups
@@ -55,7 +61,6 @@ import re
 import sys
 import time
 import unicodedata
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Third party
@@ -377,6 +382,41 @@ def clip_to_max_sentences(text, max_sentences):
     return " ".join(sentences[:max_sentences])
 
 
+def enwiki_underscore_title_from_wikidata_id(wikidata_id, session=None):
+    """
+    Resolve a Wikidata Q-id to the English Wikipedia article title (underscore form).
+
+    Intended flow: lat/lon → Wikidata id (e.g. from a simplemaps-style DB) → this
+    helper → ``fetch_toc_list`` / ``get_wikipedia_section_plain_text``.
+    """
+    raw = str(wikidata_id).strip()
+    m = re.match(r"^Q?(\d+)$", raw, re.I)
+    if not m:
+        return None
+    qid = "Q" + m.group(1)
+    params = {
+        "action": "wbgetentities",
+        "ids": qid,
+        "format": "json",
+        "props": "sitelinks",
+    }
+    url = "https://www.wikidata.org/w/api.php"
+    req = session if session is not None else requests
+    try:
+        r = req.get(url, params=params, headers=WIKIPEDIA_REQUEST_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return None
+        ent = r.json().get("entities", {}).get(qid)
+        if not ent or ent.get("missing"):
+            return None
+        title = ent.get("sitelinks", {}).get("enwiki", {}).get("title")
+        if not title:
+            return None
+        return title.replace(" ", "_")
+    except Exception:
+        return None
+
+
 def preview_wikipedia_article(
     wiki_page_name,
     session,
@@ -450,36 +490,276 @@ def preview_wikipedia_article(
 # Script entry point: wire configuration, drive I/O, print human-readable blocks
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    WIKIDATA_TEST_CITIES = [
+        ('Q60', 'New York City'),
+        ('Q65', 'Los Angeles'),
+        ('Q1297', 'Chicago'),
+        ('Q16555', 'Houston'),
+        ('Q16556', 'Phoenix, Arizona'),
+        ('Q1345', 'Philadelphia'),
+        ('Q975', 'San Antonio'),
+        ('Q16552', 'San Diego'),
+        ('Q16557', 'Dallas'),
+        ('Q16568', 'Jacksonville, Florida'),
+        ('Q16558', 'Fort Worth, Texas'),
+        ('Q16553', 'San Jose, California'),
+        ('Q16559', 'Austin, Texas'),
+        ('Q16565', 'Charlotte, North Carolina'),
+        ('Q16567', 'Columbus, Ohio'),
+        ('Q6346', 'Indianapolis'),
+        ('Q62', 'San Francisco'),
+        ('Q5083', 'Seattle'),
+        ('Q16554', 'Denver'),
+        ('Q34863', 'Oklahoma City'),
+        ('Q23197', 'Nashville, Tennessee'),
+        ('Q61', 'Washington, D.C.'),
+        ('Q16562', 'El Paso, Texas'),
+        ('Q23768', 'Las Vegas'),
+        ('Q100', 'Boston'),
+        ('Q12439', 'Detroit'),
+        ('Q43668', 'Louisville, Kentucky'),
+        ('Q6106', 'Portland, Oregon'),
+        ('Q16563', 'Memphis, Tennessee'),
+        ('Q5092', 'Baltimore'),
+        ('Q37836', 'Milwaukee'),
+        ('Q34804', 'Albuquerque, New Mexico'),
+        ('Q18575', 'Tucson, Arizona'),
+        ('Q43301', 'Fresno, California'),
+        ('Q18013', 'Sacramento, California'),
+        ('Q23556', 'Atlanta'),
+        ('Q49261', 'Mesa, Arizona'),
+        ('Q41819', 'Kansas City, Missouri'),
+        ('Q41087', 'Raleigh, North Carolina'),
+        ('Q49258', 'Colorado Springs, Colorado'),
+        ('Q43199', 'Omaha, Nebraska'),
+        ('Q8652', 'Miami'),
+        ('Q49259', 'Virginia Beach, Virginia'),
+        ('Q16739', 'Long Beach, California'),
+        ('Q17042', 'Oakland, California'),
+        ('Q36091', 'Minneapolis'),
+        ('Q49256', 'Bakersfield, California'),
+        ('Q44989', 'Tulsa, Oklahoma'),
+        ('Q49255', 'Tampa, Florida'),
+        ('Q17943', 'Arlington, Texas'),
+        ('Q49246', 'Aurora, Colorado'),
+        ('Q49266', 'Wichita, Kansas'),
+        ('Q37320', 'Cleveland'),
+        ('Q34404', 'New Orleans'),
+        ('Q49267', 'Henderson, Nevada'),
+        ('Q18094', 'Honolulu'),
+        ('Q49247', 'Anaheim, California'),
+        ('Q49233', 'Orlando, Florida'),
+        ('Q49241', 'Lexington, Kentucky'),
+        ('Q49240', 'Stockton, California'),
+        ('Q49243', 'Riverside, California'),
+        ('Q49219', 'Irvine, California'),
+        ('Q49242', 'Corpus Christi, Texas'),
+        ('Q25395', 'Newark, New Jersey'),
+        ('Q49244', 'Santa Ana, California'),
+        ('Q43196', 'Cincinnati'),
+        ('Q1342', 'Pittsburgh'),
+        ('Q28848', 'Saint Paul, Minnesota'),
+        ('Q49238', 'Greensboro, North Carolina'),
+        ('Q26339', 'Jersey City, New Jersey'),
+        ('Q49229', 'Durham, North Carolina'),
+        ('Q28260', 'Lincoln, Nebraska'),
+        ('Q143782', 'North Las Vegas, Nevada'),
+        ('Q51689', 'Plano, Texas'),
+        ('Q39450', 'Anchorage, Alaska'),
+        ('Q51684', 'Gilbert, Arizona'),
+        ('Q43788', 'Madison, Wisconsin'),
+        ('Q49225', 'Reno, Nevada'),
+        ('Q49272', 'Chandler, Arizona'),
+        ('Q38022', 'St. Louis'),
+        ('Q49270', 'Chula Vista, California'),
+        ('Q40435', 'Buffalo, New York'),
+        ('Q49268', 'Fort Wayne, Indiana'),
+        ('Q49273', 'Lubbock, Texas'),
+        ('Q49236', 'St. Petersburg, Florida'),
+        ('Q49239', 'Toledo, Ohio'),
+        ('Q16868', 'Laredo, Texas'),
+        ('Q667749', 'Port St. Lucie, Florida'),
+        ('Q51682', 'Glendale, Arizona'),
+        ('Q51690', 'Irving, Texas'),
+        ('Q49227', 'Winston-Salem, North Carolina'),
+        ('Q49222', 'Chesapeake, Virginia'),
+        ('Q49274', 'Garland, Texas'),
+        ('Q49221', 'Scottsdale, Arizona'),
+        ('Q35775', 'Boise, Idaho'),
+        ('Q49276', 'Hialeah, Florida'),
+        ('Q128269', 'Frisco, Texas'),
+        ('Q43421', 'Richmond, Virginia'),
+        ('Q462789', 'Cape Coral, Florida'),
+        ('Q49231', 'Norfolk, Virginia'),
+        ('Q187805', 'Spokane, Washington'),
+        ('Q79860', 'Huntsville, Alabama'),
+        ('Q491132', 'Santa Clarita, California'),
+        ('Q199797', 'Tacoma, Washington'),
+        ('Q49220', 'Fremont, California'),
+        ('Q51697', 'McKinney, Texas'),
+        ('Q486168', 'San Bernardino, California'),
+        ('Q28218', 'Baton Rouge, Louisiana'),
+        ('Q204561', 'Modesto, California'),
+        ('Q491128', 'Fontana, California'),
+        ('Q23337', 'Salt Lake City'),
+        ('Q494720', 'Moreno Valley, California'),
+        ('Q39709', 'Des Moines, Iowa'),
+        ('Q49179', 'Worcester, Massachusetts'),
+        ('Q128114', 'Yonkers, New York'),
+        ('Q331104', 'Fayetteville, North Carolina'),
+        ('Q131335', 'Sioux Falls, South Dakota'),
+        ('Q51694', 'Grand Prairie, Texas'),
+        ('Q49218', 'Rochester, New York'),
+        ('Q37043', 'Tallahassee, Florida'),
+        ('Q33405', 'Little Rock, Arkansas'),
+        ('Q51691', 'Amarillo, Texas'),
+        ('Q500481', 'Overland Park, Kansas'),
+        ('Q239870', 'Columbus, Georgia'),
+        ('Q181962', 'Augusta, Georgia'),
+        ('Q79875', 'Mobile, Alabama'),
+        ('Q209338', 'Oxnard, California'),
+        ('Q184587', 'Grand Rapids, Michigan'),
+        ('Q51686', 'Peoria, Arizona'),
+        ('Q234053', 'Vancouver, Washington'),
+        ('Q185582', 'Knoxville, Tennessee'),
+        ('Q79867', 'Birmingham, Alabama'),
+        ('Q29364', 'Montgomery, Alabama'),
+        ('Q18383', 'Providence, Rhode Island'),
+        ('Q5917', 'Huntington Beach, California'),
+        ('Q51693', 'Brownsville, Texas'),
+        ('Q186702', 'Chattanooga, Tennessee'),
+        ('Q165972', 'Fort Lauderdale, Florida'),
+        ('Q51685', 'Tempe, Arizona'),
+        ('Q163132', 'Akron, Ohio'),
+        ('Q485716', 'Glendale, California'),
+        ('Q328941', 'Clarksville, Tennessee'),
+        ('Q488134', 'Ontario, California'),
+        ('Q335017', 'Newport News, Virginia'),
+        ('Q671314', 'Elk Grove, California'),
+        ('Q852665', 'Cary, North Carolina'),
+        ('Q22595', 'Aurora, Illinois'),
+        ('Q43919', 'Salem, Oregon'),
+        ('Q370972', 'Pembroke Pines, Florida'),
+        ('Q171224', 'Eugene, Oregon'),
+        ('Q212991', 'Santa Rosa, California'),
+        ('Q495365', 'Rancho Cucamonga, California'),
+        ('Q80517', 'Shreveport, Louisiana'),
+        ('Q50054', 'Garden Grove, California'),
+        ('Q488924', 'Oceanside, California'),
+        ('Q490732', 'Fort Collins, Colorado'),
+        ('Q135615', 'Springfield, Missouri'),
+        ('Q501766', 'Murfreesboro, Tennessee'),
+        ('Q51687', 'Surprise, Arizona'),
+        ('Q494711', 'Lancaster, California'),
+        ('Q128306', 'Denton, Texas'),
+        ('Q491340', 'Roseville, California'),
+        ('Q488940', 'Palmdale, California'),
+        ('Q494707', 'Corona, California'),
+        ('Q488125', 'Salinas, California'),
+        ('Q128228', 'Killeen, Texas'),
+        ('Q138391', 'Paterson, New Jersey'),
+        ('Q88', 'Alexandria, Virginia'),
+        ('Q234453', 'Hollywood, Florida'),
+        ('Q491114', 'Hayward, California'),
+        ('Q47716', 'Charleston, South Carolina'),
+        ('Q219656', 'Macon, Georgia'),
+        ('Q462804', 'Lakewood, Colorado'),
+        ('Q208459', 'Sunnyvale, California'),
+        ('Q486472', 'Kansas City, Kansas'),
+        ('Q49158', 'Springfield, Massachusetts'),
+        ('Q214164', 'Bellevue, Washington'),
+        ('Q243007', 'Naperville, Illinois'),
+        ('Q40345', 'Joliet, Illinois'),
+        ('Q49174', 'Bridgeport, Connecticut'),
+        ('Q51696', 'Mesquite, Texas'),
+        ('Q51695', 'Pasadena, Texas'),
+        ('Q593022', 'Olathe, Kansas'),
+        ('Q372454', 'Escondido, California'),
+        ('Q83813', 'Savannah, Georgia'),
+        ('Q51698', 'McAllen, Texas'),
+        ('Q487999', 'Gainesville, Florida'),
+        ('Q486868', 'Pomona, California'),
+        ('Q233892', 'Rockford, Illinois'),
+        ('Q579761', 'Thornton, Colorado'),
+        ('Q128244', 'Waco, Texas'),
+        ('Q495373', 'Visalia, California'),
+        ('Q128069', 'Syracuse, New York'),
+        ('Q38453', 'Columbia, South Carolina'),
+        ('Q128321', 'Midland, Texas'),
+        ('Q745168', 'Miramar, Florida'),
+        ('Q816809', 'Palm Bay, Florida'),
+        ('Q1088792', 'Lakewood Township, New Jersey'),
+        ('Q28198', 'Jackson, Mississippi'),
+        ('Q505557', 'Coral Springs, Florida'),
+        ('Q495353', 'Victorville, California'),
+        ('Q138311', 'Elizabeth, New Jersey'),
+        ('Q494723', 'Fullerton, California'),
+        ('Q1085274', 'Meridian, Idaho'),
+        ('Q489197', 'Torrance, California'),
+        ('Q49169', 'Stamford, Connecticut'),
+        ('Q52465', 'West Valley City, Utah'),
+        ('Q491350', 'Orange, California'),
+        ('Q486439', 'Cedar Rapids, Iowa'),
+        ('Q499401', 'Warren, Michigan'),
+        ('Q342043', 'Hampton, Virginia'),
+        ('Q49145', 'New Haven, Connecticut'),
+        ('Q485176', 'Pasadena, California'),
+        ('Q844008', 'Kent, Washington'),
+        ('Q34739', 'Dayton, Ohio'),
+        ('Q34109', 'Fargo, North Dakota'),
+        ('Q26495', 'Lewisville, Texas'),
+        ('Q128261', 'Carrollton, Texas'),
+        ('Q128334', 'Round Rock, Texas'),
+        ('Q927243', 'Sterling Heights, Michigan'),
+        ('Q159260', 'Santa Clara, California'),
+        ('Q40347', 'Norman, Oklahoma'),
+        ('Q59670', 'Columbia, Missouri'),
+        ('Q128295', 'Abilene, Texas'),
+        ('Q982550', 'Pearland, Texas'),
+        ('Q203263', 'Athens, Georgia'),
+        ('Q695511', 'College Station, Texas'),
+        ('Q303794', 'Clovis, California'),
+        ('Q163749', 'West Palm Beach, Florida'),
+        ('Q142811', 'Allentown, Pennsylvania'),
+        ('Q847538', 'North Charleston, South Carolina'),
+        ('Q323414', 'Simi Valley, California'),
+        ('Q41057', 'Topeka, Kansas'),
+        ('Q659400', 'Wilmington, North Carolina'),
+        ('Q639452', 'Lakeland, Florida'),
+        ('Q208447', 'Thousand Oaks, California'),
+        ('Q490441', 'Concord, California'),
+        ('Q486479', 'Rochester, Minnesota'),
+        ('Q208445', 'Vallejo, California'),
+        ('Q485172', 'Ann Arbor, Michigan'),
+        ('Q835810', 'Broken Arrow, Oklahoma'),
+        ('Q323432', 'Fairfield, California'),
+        ('Q128891', 'Lafayette, Louisiana'),
+        ('Q33486', 'Hartford, Connecticut'),
+        ('Q590849', 'Arvada, Colorado'),
+        ('Q484678', 'Berkeley, California'),
+        ('Q24603', 'Independence, Missouri'),
+        ('Q166304', 'Billings, Montana'),
+        ('Q49111', 'Cambridge, Massachusetts'),
+        ('Q49162', 'Lowell, Massachusetts'),
+    ]
+
     max_sentences_to_display = 5
 
     section_topics = ["history", "geography"]
-
-    # --- 250 US city Wikipedia titles (underscores; population table order) -----
-    _CITY_LIST_PATH = Path(__file__).resolve().parent / "us_city_pages_250.txt"
-    CITY_PAGE_NAMES_US_250 = [
-        ln.strip()
-        for ln in _CITY_LIST_PATH.read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-
-    SINGLE_WIKI_PAGE_ONLY = None  # e.g. "Fort_Pierce,_Florida"
 
     # ``"errors_only"`` → one status line per city; details only on FAIL.
     # ``"full"`` → print Introduction / History / Geography for every city.
     BATCH_SHOW = "errors_only"
 
-    # Subset after optional shuffle (Python ``list`` slicing), e.g.:
-    #   slice(None)    → all 250
-    #   slice(0, 250)  → indices 0 .. 249
-    #   slice(0, 9, 3) → indices 0, 3, 6
+    # Subset after optional shuffle: slice(None) | slice(0, 250) | slice(0, 9, 3), etc.
     CITY_TEST_SLICE = slice(0, 250)
 
     BATCH_SHUFFLE_SEED = None
     BATCH_DELAY_SECONDS = 0.2
 
-    # Optional CLI: overrides ``CITY_TEST_SLICE`` (applied after shuffle):
-    #   python wikipediaApiV9.py N              → slice(0, N); N<=0 → all
-    #   python wikipediaApiV9.py start stop [step]
+    # Debug one entity: e.g. ("Q16554", "Denver")
+    SINGLE_WIKIDATA_FIXTURE = None
+
     city_slice = CITY_TEST_SLICE
     if len(sys.argv) >= 2:
         parts = []
@@ -503,29 +783,41 @@ if __name__ == "__main__":
 
     http = requests.Session()
     http.headers.update(WIKIPEDIA_REQUEST_HEADERS)
-
     show_full_sections = BATCH_SHOW == "full"
 
-    if SINGLE_WIKI_PAGE_ONLY:
+    def _row_label(qid_, name_):
+        return f"{name_} ({qid_})"
+
+    if SINGLE_WIKIDATA_FIXTURE is not None:
+        _q, _name = SINGLE_WIKIDATA_FIXTURE
+        _page = enwiki_underscore_title_from_wikidata_id(_q, session=http)
+        if not _page:
+            print(f"No en.wikipedia.org sitelink for {_q} ({_name})", file=sys.stderr)
+            sys.exit(1)
         preview_wikipedia_article(
-            SINGLE_WIKI_PAGE_ONLY.strip(),
+            _page,
             http,
             section_topics,
             max_sentences_to_display,
             verbose=show_full_sections,
         )
     else:
-        cities = list(CITY_PAGE_NAMES_US_250)
+        rows = list(WIKIDATA_TEST_CITIES)
         if BATCH_SHUFFLE_SEED is not None:
-            random.Random(BATCH_SHUFFLE_SEED).shuffle(cities)
-        cities_run = cities[city_slice]
-        if not cities_run:
+            random.Random(BATCH_SHUFFLE_SEED).shuffle(rows)
+        rows_run = rows[city_slice]
+        if not rows_run:
             print("No cities selected (empty slice).", file=sys.stderr)
             sys.exit(1)
 
-        if len(cities_run) == 1:
+        if len(rows_run) == 1:
+            _q, _name = rows_run[0]
+            _page = enwiki_underscore_title_from_wikidata_id(_q, session=http)
+            if not _page:
+                print(f"No en.wikipedia.org sitelink for {_q} ({_name})", file=sys.stderr)
+                sys.exit(1)
             preview_wikipedia_article(
-                cities_run[0],
+                _page,
                 http,
                 section_topics,
                 max_sentences_to_display,
@@ -533,28 +825,42 @@ if __name__ == "__main__":
             )
         else:
             print(
-                f"Batch: {len(cities_run)} cities | slice {city_slice} | "
+                f"Batch: {len(rows_run)} cities | slice {city_slice} | "
                 f"show={BATCH_SHOW!r} | delay={BATCH_DELAY_SECONDS}s\n"
             )
             results = []
-            for i, page in enumerate(cities_run, start=1):
+            for i, (_q, _name) in enumerate(rows_run, start=1):
+                label = _row_label(_q, _name)
+                _page = enwiki_underscore_title_from_wikidata_id(_q, session=http)
+                if not _page:
+                    print(
+                        f"[{i}/{len(rows_run)}] {label} ... FAIL\n"
+                        f"         · no en.wikipedia.org sitelink for {_q}",
+                        flush=True,
+                    )
+                    results.append(
+                        {"page": _q, "ok": False, "notes": ["no enwiki sitelink"]}
+                    )
+                    time.sleep(BATCH_DELAY_SECONDS)
+                    continue
                 if show_full_sections:
-                    print(f"\n{'#' * 72}\n[{i}/{len(cities_run)}] {page}\n{'#' * 72}")
+                    bar = "#" * 72
+                    print(f"\n{bar}\n[{i}/{len(rows_run)}] {label}\n{bar}")
                 else:
-                    print(f"[{i}/{len(cities_run)}] {page} ... ", end="", flush=True)
+                    print(f"[{i}/{len(rows_run)}] {label} ... ", end="", flush=True)
                 r = preview_wikipedia_article(
-                    page,
+                    _page,
                     http,
                     section_topics,
                     max_sentences_to_display,
                     verbose=show_full_sections,
                 )
+                r["wikidata_id"] = _q
+                r["label"] = _name
                 results.append(r)
                 if show_full_sections:
-                    print(
-                        f"\n——— [{i}/{len(cities_run)}] {page}: "
-                        f"{'OK' if r['ok'] else 'FAIL'} ———\n"
-                    )
+                    st = "OK" if r["ok"] else "FAIL"
+                    print(f"\n——— [{i}/{len(rows_run)}] {label}: {st} ———\n")
                 else:
                     print("OK" if r["ok"] else "FAIL")
                     if not r["ok"]:
@@ -564,6 +870,10 @@ if __name__ == "__main__":
 
             ok_n = sum(1 for r in results if r["ok"])
             print(f"\n--- summary: {ok_n}/{len(results)} passed ---")
-            failed = [r["page"] for r in results if not r["ok"]]
+            failed = [
+                f"{r.get('label', '?')} ({r.get('wikidata_id', '?')})"
+                for r in results
+                if not r["ok"]
+            ]
             if failed:
-                print("Failed pages:", "; ".join(failed))
+                print("Failed:", "; ".join(failed))
