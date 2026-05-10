@@ -45,8 +45,10 @@ This mirrors other Motormouth wiki utilities that depend on Punkt-like models.
 # ---------------------------------------------------------------------------
 # Standard library
 # ---------------------------------------------------------------------------
+import random
 import re
 import sys
+import time
 import unicodedata
 
 # ---------------------------------------------------------------------------
@@ -367,15 +369,79 @@ def clip_to_max_sentences(text, max_sentences):
     return " ".join(sentences[:max_sentences])
 
 
+def preview_wikipedia_article(
+    wiki_page_name,
+    session,
+    section_topics,
+    max_sentences_to_display,
+    *,
+    verbose=True,
+):
+    """
+    Fetch the article introduction (section ``0``) plus each ``section_topics`` TOC
+    match; optionally print blocks. Returns a small status dict for batch runs.
+
+    Returns:
+        dict with keys: ``page``, ``ok`` (bool), ``notes`` (list of str).
+    """
+    notes = []
+    toc_list, toc_code = fetch_toc_list(wiki_page_name, session=session)
+    if toc_code != 200:
+        msg = f"TOC request failed (HTTP {toc_code})"
+        if verbose:
+            print(msg)
+        return {"page": wiki_page_name, "ok": False, "notes": [msg]}
+
+    fetch_plan = [("0", "Introduction", None)]
+    for keyword in section_topics:
+        sec_index, title = first_toc_match(toc_list, keyword)
+        fetch_plan.append((sec_index, title or keyword.upper(), keyword))
+
+    intro_ok = False
+    section_http_error = False
+
+    for sec_index, heading, keyword in fetch_plan:
+        if verbose:
+            bar = "=" * 72
+            print(f"\n{bar}\n{heading}\n{bar}")
+
+        if sec_index is None:
+            notes.append(f'missing section match for {keyword!r}')
+            if verbose:
+                print(f'(No TOC section matching "{keyword}")')
+            continue
+
+        body, _paras, sec_code, _no_para = get_wikipedia_section_plain_text(
+            wiki_page_name, sec_index, session=session
+        )
+
+        if sec_code == 200 and body and str(body).strip():
+            clipped = clip_to_max_sentences(body, max_sentences_to_display)
+            if verbose:
+                print(clipped)
+            if heading == "Introduction" and any(ch.isalpha() for ch in clipped):
+                intro_ok = True
+        elif sec_code == 200:
+            notes.append(f"{heading}: empty")
+            if verbose:
+                print("(empty section)")
+        else:
+            section_http_error = True
+            notes.append(f"{heading}: fetch failed ({body!s:.120})")
+            if verbose:
+                print(body)
+
+    ok = intro_ok and not section_http_error
+    if not intro_ok:
+        notes.append("introduction: no usable text after clip")
+
+    return {"page": wiki_page_name, "ok": ok, "notes": notes}
+
+
 # ---------------------------------------------------------------------------
 # Script entry point: wire configuration, drive I/O, print human-readable blocks
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # --- Article selection ---------------------------------------------------
-    # Title string as accepted by the English Wikipedia API (underscores for spaces
-    # in compound names is the conventional stable form in this codebase).
-    wikipedia_page_name = "Fort_Pierce,_Florida"
-
     # --- Output shaping ------------------------------------------------------
     # Cap printed sentences per block (introduction, then each TOC topic). Set to 0
     # (or any non-positive) to dump the entire cleaned body without NLTK truncation.
@@ -385,43 +451,194 @@ if __name__ == "__main__":
     # Introduction uses MediaWiki section index "0" (lead before first heading).
     # Each keyword here is matched against TOC titles (exact title, then safe
     # substring). See ``first_toc_match``.
-    # One keyword == one parse+text request after the intro fetch.
     section_topics = ["history", "geography"]
 
-    # --- HTTP session --------------------------------------------------------
-    # Single Session shares cookies/connection pool; headers copied so every request
-    # gets the compliant User-Agent without repeating the dict literal at call sites.
+    # --- Batch harness: sample cities + how many to run ----------------------
+    # English Wikipedia `page` titles (underscores between words). Diverse mix for
+    # smoke testing—not a definitive geographic census.
+    CITY_PAGE_NAMES_SAMPLE = """
+New_York_City
+Los_Angeles
+Chicago
+Houston
+Phoenix,_Arizona
+Philadelphia
+San_Antonio
+San_Diego
+Dallas
+Austin,_Texas
+Jacksonville,_Florida
+Fort_Worth,_Texas
+Columbus,_Ohio
+Charlotte,_North_Carolina
+San_Francisco
+Indianapolis
+Seattle
+Denver,_Colorado
+Boston
+El_Paso,_Texas
+Nashville,_Tennessee
+Detroit
+Portland,_Oregon
+Las_Vegas
+Memphis,_Tennessee
+Louisville,_Kentucky
+Baltimore
+Milwaukee
+Albuquerque,_New_Mexico
+Tucson,_Arizona
+Fresno,_California
+Sacramento,_California
+Kansas_City,_Missouri
+Atlanta
+Miami
+Oakland,_California
+Minneapolis
+Tulsa,_Oklahoma
+Cleveland
+Wichita,_Kansas
+Arlington,_Texas
+New_Orleans
+Honolulu
+Tampa,_Florida
+London
+Paris
+Berlin
+Rome
+Madrid
+Amsterdam
+Vienna
+Brussels
+Moscow
+Warsaw
+Prague
+Budapest
+Athens
+Dublin
+Stockholm
+Copenhagen
+Lisbon
+Bucharest
+Istanbul
+Dubai
+Cairo
+Lagos
+Johannesburg
+Nairobi
+Buenos_Aires
+Santiago
+Lima
+Mexico_City
+Toronto
+Vancouver
+Sydney
+Melbourne
+Tokyo
+Osaka
+Seoul
+Beijing
+Shanghai
+Hong_Kong
+Singapore
+Bangkok
+Jakarta
+Manila
+Mumbai
+Delhi
+Tehran
+Tel_Aviv
+Casablanca
+Cape_Town
+Rio_de_Janeiro
+Montreal
+Perth
+Brisbane
+Auckland
+Kyiv
+Saint_Petersburg
+Fort_Pierce,_Florida
+    """.split()
+
+    # If set (non-empty string), run a verbose preview for this page only—ignores
+    # NUM_CITIES_TO_TEST and the sample list order except as a fallback label.
+    SINGLE_WIKI_PAGE_ONLY = None  # e.g. "Fort_Pierce,_Florida"
+
+    # How many entries from CITY_PAGE_NAMES_SAMPLE to run in batch mode:
+    #   1   → only the first city in the list after optional shuffle
+    #   0 or None → all cities in the list
+    NUM_CITIES_TO_TEST = 1
+
+    # Optional override: ``python wikipediaApiV9.py 10`` runs the first 10 cities (after
+    # shuffle) without editing this file. ``python wikipediaApiV9.py 0`` runs all.
+    if len(sys.argv) >= 2:
+        try:
+            arg_n = int(sys.argv[1])
+            NUM_CITIES_TO_TEST = None if arg_n == 0 else arg_n
+        except ValueError:
+            print("Usage: python wikipediaApiV9.py [N]   (N=0 means all cities)", file=sys.stderr)
+            sys.exit(2)
+
+    # If an int, `random.Random(seed).shuffle` the sample before slicing (reproducible
+    # “random” order). If None, keep the list order above.
+    BATCH_SHUFFLE_SEED = None
+
+    # Pause between cities in batch mode (Wikimedia rate courtesy).
+    BATCH_DELAY_SECONDS = 0.2
+
     http = requests.Session()
     http.headers.update(WIKIPEDIA_REQUEST_HEADERS)
 
-    # --- Phase 1: discover section indices -----------------------------------
-    toc_list, toc_code = fetch_toc_list(wikipedia_page_name, session=http)
-    if toc_code != 200:
-        # Without a TOC we cannot map friendly names to hidden section ids—fail fast.
-        print("Wikipedia TOC request failed; cannot resolve section indices.")
-        sys.exit(1)
-
-    # --- Phase 2: introduction (section 0) + TOC-driven sections -----------
-    fetch_plan = [("0", "Introduction", None)]
-    for keyword in section_topics:
-        sec_index, title = first_toc_match(toc_list, keyword)
-        fetch_plan.append((sec_index, title or keyword.upper(), keyword))
-
-    for sec_index, heading, keyword in fetch_plan:
-        bar = "=" * 72
-        print(f"\n{bar}\n{heading}\n{bar}")
-
-        if sec_index is None:
-            print(f'(No TOC section matching "{keyword}")')
-            continue
-
-        body, _paras, sec_code, _no_para = get_wikipedia_section_plain_text(
-            wikipedia_page_name, sec_index, session=http
+    if SINGLE_WIKI_PAGE_ONLY:
+        preview_wikipedia_article(
+            SINGLE_WIKI_PAGE_ONLY.strip(),
+            http,
+            section_topics,
+            max_sentences_to_display,
+            verbose=True,
         )
+    else:
+        cities = [x.strip() for x in CITY_PAGE_NAMES_SAMPLE if x.strip()]
+        if BATCH_SHUFFLE_SEED is not None:
+            rng = random.Random(BATCH_SHUFFLE_SEED)
+            rng.shuffle(cities)
 
-        if sec_code == 200 and body and str(body).strip():
-            print(clip_to_max_sentences(body, max_sentences_to_display))
-        elif sec_code == 200:
-            print("(empty section)")
+        limit = NUM_CITIES_TO_TEST
+        if limit is None or limit <= 0:
+            cities_run = cities
         else:
-            print(body)
+            cities_run = cities[: min(limit, len(cities))]
+
+        if len(cities_run) == 1:
+            preview_wikipedia_article(
+                cities_run[0],
+                http,
+                section_topics,
+                max_sentences_to_display,
+                verbose=True,
+            )
+        else:
+            print(
+                f"Batch: {len(cities_run)} cities, "
+                f"{BATCH_DELAY_SECONDS}s delay between pages\n"
+            )
+            results = []
+            for i, page in enumerate(cities_run, start=1):
+                print(f"[{i}/{len(cities_run)}] {page} ... ", end="", flush=True)
+                r = preview_wikipedia_article(
+                    page,
+                    http,
+                    section_topics,
+                    max_sentences_to_display,
+                    verbose=False,
+                )
+                results.append(r)
+                print("OK" if r["ok"] else "FAIL")
+                for note in r["notes"]:
+                    print(f"         · {note}")
+                time.sleep(BATCH_DELAY_SECONDS)
+
+            ok_n = sum(1 for r in results if r["ok"])
+            print(f"\n--- summary: {ok_n}/{len(results)} passed ---")
+            failed = [r["page"] for r in results if not r["ok"]]
+            if failed:
+                print("Failed pages:", "; ".join(failed))
