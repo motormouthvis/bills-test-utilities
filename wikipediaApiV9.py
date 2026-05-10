@@ -557,8 +557,8 @@ if __name__ == "__main__":
 
     max_sentences_to_display = 5
     section_topics = ["history", "geography"]
-    BATCH_SHOW = "errors_only"  # or "full"
-    CITY_TEST_SLICE = slice(0, 250)
+    BATCH_SHOW = "full" #"errors_only"   or "full"
+    CITY_TEST_SLICE = slice(0, 5)
     BATCH_SHUFFLE_SEED = None
     BATCH_DELAY_SECONDS = 0.2
     SINGLE_WIKIDATA_FIXTURE = None  # e.g. ("Q16554", "Denver")
